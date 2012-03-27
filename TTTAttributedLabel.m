@@ -24,6 +24,8 @@
 
 #define kTTTLineBreakWordWrapTextWidthScalingFactor (M_PI / M_E)
 
+NSString * const kTTTStrikeOutAttributeName = @"TTTStrikeOutAttribute";
+
 static inline CTTextAlignment CTTextAlignmentFromUITextAlignment(UITextAlignment alignment) {
 	switch (alignment) {
 		case UITextAlignmentLeft: return kCTLeftTextAlignment;
@@ -76,7 +78,6 @@ static inline NSDictionary * NSAttributedStringAttributesFromLabel(TTTAttributed
     [mutableAttributes setObject:(id)[label.textColor CGColor] forKey:(NSString *)kCTForegroundColorAttributeName];
     
     CTTextAlignment alignment = CTTextAlignmentFromUITextAlignment(label.textAlignment);
-    CTLineBreakMode lineBreakMode = CTLineBreakModeFromUILineBreakMode(label.lineBreakMode);
     CGFloat lineSpacing = label.leading;
     CGFloat lineHeightMultiple = label.lineHeightMultiple;
     CGFloat topMargin = label.textInsets.top;
@@ -84,6 +85,15 @@ static inline NSDictionary * NSAttributedStringAttributesFromLabel(TTTAttributed
     CGFloat leftMargin = label.textInsets.left;
     CGFloat rightMargin = label.textInsets.right;
     CGFloat firstLineIndent = label.firstLineIndent + leftMargin;
+
+    CTLineBreakMode lineBreakMode;
+    if (label.numberOfLines != 1) {
+        lineBreakMode = CTLineBreakModeFromUILineBreakMode(UILineBreakModeWordWrap);
+    }
+    else {
+        lineBreakMode = CTLineBreakModeFromUILineBreakMode(label.lineBreakMode);
+    }
+	
     CTParagraphStyleSetting paragraphStyles[9] = {
 		{.spec = kCTParagraphStyleSpecifierAlignment, .valueSize = sizeof(CTTextAlignment), .value = (const void *)&alignment},
 		{.spec = kCTParagraphStyleSpecifierLineBreakMode, .valueSize = sizeof(CTLineBreakMode), .value = (const void *)&lineBreakMode},
@@ -93,9 +103,10 @@ static inline NSDictionary * NSAttributedStringAttributesFromLabel(TTTAttributed
         {.spec = kCTParagraphStyleSpecifierParagraphSpacingBefore, .valueSize = sizeof(CGFloat), .value = (const void *)&topMargin},
         {.spec = kCTParagraphStyleSpecifierParagraphSpacing, .valueSize = sizeof(CGFloat), .value = (const void *)&bottomMargin},
         {.spec = kCTParagraphStyleSpecifierHeadIndent, .valueSize = sizeof(CGFloat), .value = (const void *)&leftMargin},
-        {.spec = kCTParagraphStyleSpecifierTailIndent, .valueSize = sizeof(CGFloat), .value = (const void *)&rightMargin},
+        {.spec = kCTParagraphStyleSpecifierTailIndent, .valueSize = sizeof(CGFloat), .value = (const void *)&rightMargin}
 	};
-	CTParagraphStyleRef paragraphStyle = CTParagraphStyleCreate(paragraphStyles, 9);
+
+    CTParagraphStyleRef paragraphStyle = CTParagraphStyleCreate(paragraphStyles, 9);
 	[mutableAttributes setObject:(id)paragraphStyle forKey:(NSString *)kCTParagraphStyleAttributeName];
 	CFRelease(paragraphStyle);
     
@@ -132,6 +143,7 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
 - (NSTextCheckingResult *)linkAtPoint:(CGPoint)p;
 - (NSUInteger)characterIndexAtPoint:(CGPoint)p;
 - (void)drawFramesetter:(CTFramesetterRef)framesetter textRange:(CFRange)textRange inRect:(CGRect)rect context:(CGContextRef)c;
+- (void)drawStrike:(CTFrameRef)frame inRect:(CGRect)rect context:(CGContextRef)c;
 - (void)handleTap:(UITapGestureRecognizer *)gestureRecognizer;
 @end
 
@@ -309,7 +321,7 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
 - (NSTextCheckingResult *)linkAtCharacterIndex:(CFIndex)idx {
     for (NSTextCheckingResult *result in self.links) {
         NSRange range = result.range;
-        if ((CFIndex)range.location <= idx && idx <= (CFIndex)(range.location + range.length)) {
+        if ((CFIndex)range.location <= idx && idx <= (CFIndex)(range.location + range.length - 1)) {
             return result;
         }
     }
@@ -335,28 +347,54 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
     // Convert tap coordinates (start at top left) to CT coordinates (start at bottom left)
     p = CGPointMake(p.x, textRect.size.height - p.y);
 
-    CFIndex idx = NSNotFound;
     CGMutablePathRef path = CGPathCreateMutable();
     CGPathAddRect(path, NULL, textRect);
     CTFrameRef frame = CTFramesetterCreateFrame(self.framesetter, CFRangeMake(0, [self.attributedText length]), path, NULL);
+    if (frame == NULL) {
+        CFRelease(path);
+        return NSNotFound;
+    }
+
     CFArrayRef lines = CTFrameGetLines(frame);
     NSUInteger numberOfLines = CFArrayGetCount(lines);
+    if (numberOfLines == 0) {
+        CFRelease(frame);
+        CFRelease(path);
+        return NSNotFound;
+    }
+
     CGPoint lineOrigins[numberOfLines];
     CTFrameGetLineOrigins(frame, CFRangeMake(0, 0), lineOrigins);
-    NSUInteger lineIndex;
 
+    NSUInteger lineIndex;
     for (lineIndex = 0; lineIndex < (numberOfLines - 1); lineIndex++) {
         CGPoint lineOrigin = lineOrigins[lineIndex];
         if (lineOrigin.y < p.y) {
             break;
         }
     }
-    
+
+    if (lineIndex >= numberOfLines) {
+        CFRelease(frame);
+        CFRelease(path);
+        return NSNotFound;
+    }
+
     CGPoint lineOrigin = lineOrigins[lineIndex];
     CTLineRef line = CFArrayGetValueAtIndex(lines, lineIndex);
     // Convert CT coordinates to line-relative coordinates
     CGPoint relativePoint = CGPointMake(p.x - lineOrigin.x, p.y - lineOrigin.y);
-    idx = CTLineGetStringIndexForPosition(line, relativePoint);
+    CFIndex idx = CTLineGetStringIndexForPosition(line, relativePoint);
+
+    // We should check if we are outside the string range
+    CFIndex glyphCount = CTLineGetGlyphCount(line);
+    CFRange stringRange = CTLineGetStringRange(line);
+    CFIndex stringRelativeStart = stringRange.location;
+    if ((idx - stringRelativeStart) == glyphCount) {
+        CFRelease(frame);
+        CFRelease(path);
+        return NSNotFound;
+    }
     
     CFRelease(frame);
     CFRelease(path);
@@ -375,6 +413,7 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
     } else {
         CFArrayRef lines = CTFrameGetLines(frame);
         NSUInteger numberOfLines = MIN(self.numberOfLines, CFArrayGetCount(lines));
+        BOOL truncateLastLine = (self.lineBreakMode == UILineBreakModeHeadTruncation || self.lineBreakMode == UILineBreakModeMiddleTruncation || self.lineBreakMode == UILineBreakModeTailTruncation);
 
         CGPoint lineOrigins[numberOfLines];
         CTFrameGetLineOrigins(frame, CFRangeMake(0, numberOfLines), lineOrigins);
@@ -383,12 +422,150 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
             CGPoint lineOrigin = lineOrigins[lineIndex];
             CGContextSetTextPosition(c, lineOrigin.x, lineOrigin.y);
             CTLineRef line = CFArrayGetValueAtIndex(lines, lineIndex);
-            CTLineDraw(line, c);
+
+            if (lineIndex == numberOfLines - 1 && truncateLastLine) {
+                // Check if the range of text in the last line reaches the end of the full attributed string
+                CFRange lastLineRange = CTLineGetStringRange(line);
+                
+                if (lastLineRange.location + lastLineRange.length < textRange.location + textRange.length) {
+                    // Get the attributes of the last character in the line and use them to create the truncation token string
+                    NSDictionary *tokenAttributes = [self.attributedText attributesAtIndex:(lastLineRange.location + lastLineRange.length - 1) effectiveRange:NULL];
+                    NSAttributedString *tokenString = [[[NSAttributedString alloc] initWithString:@"\u2026" attributes:tokenAttributes] autorelease]; // \u2026 is the Unicode horizontal ellipsis character code
+                    CTLineRef truncationToken = CTLineCreateWithAttributedString((CFAttributedStringRef)tokenString);
+                    
+                    if (lineIndex == 0) {
+                        // There is only one line, do head, middle, or tail truncation
+                        
+                        // Create and draw a truncated line
+                        CTLineTruncationType truncationType;
+                        switch (self.lineBreakMode) {
+                            case UILineBreakModeHeadTruncation:
+                                truncationType = kCTLineTruncationStart;
+                                break;
+                            case UILineBreakModeMiddleTruncation:
+                                truncationType = kCTLineTruncationMiddle;
+                                break;
+                            case UILineBreakModeTailTruncation:
+                            default:
+                                truncationType = kCTLineTruncationEnd;
+                                break;
+                        }
+
+                        CTLineRef truncatedLine = CTLineCreateTruncatedLine(line, rect.size.width, truncationType, truncationToken);                        
+                        if (!truncatedLine) {
+                            // If the line is not as wide as the truncationToken, truncatedLine is NULL
+                            truncatedLine = CFRetain(truncationToken);
+                        }
+                        CTLineDraw(truncatedLine, c);
+                        CFRelease(truncatedLine);
+                    }
+                    else {
+                        // There are multiple lines, only do tail truncation
+                        
+                        // CoreText will only truncate if this line is too long, but it needs the truncation token even if it's not, so we need to append one
+                        NSMutableAttributedString *stringWithToken = [[self.attributedText attributedSubstringFromRange:NSMakeRange(lastLineRange.location, lastLineRange.length)] mutableCopy];
+                        if (lastLineRange.length > 0) {
+                            // Remove any newline at the end (we don't want newline space between the text and the truncation token). There can only be one, because the second would be on the next line.
+                            unichar lastCharacter = [[stringWithToken string] characterAtIndex:lastLineRange.length - 1];
+                            if ([[NSCharacterSet newlineCharacterSet] characterIsMember:lastCharacter]) {
+                                [stringWithToken deleteCharactersInRange:NSMakeRange(lastLineRange.length - 1, 1)];
+                            }
+                        }
+                        [stringWithToken appendAttributedString:tokenString];
+                        CTLineRef stringWithTokenLine = CTLineCreateWithAttributedString((CFAttributedStringRef)stringWithToken);
+                        
+                        // Truncate the line in case it is too long.
+                        CTLineRef truncatedLine = CTLineCreateTruncatedLine(stringWithTokenLine, rect.size.width, kCTLineTruncationEnd, truncationToken);
+                        CTLineDraw(truncatedLine, c);
+                        
+                        CFRelease(truncatedLine);
+                        CFRelease(stringWithTokenLine);
+                        [stringWithToken release];
+                    }
+                    CFRelease(truncationToken);
+                }
+                else {
+                    CTLineDraw(line, c);
+                }
+            }
+            else {
+                CTLineDraw(line, c);
+            }
         }
     }
+
+    [self drawStrike:frame inRect:rect context:c];
     
     CFRelease(frame);
     CFRelease(path);
+}
+
+- (void)drawStrike:(CTFrameRef)frame inRect:(CGRect)rect context:(CGContextRef)c {
+    NSArray *lines = (NSArray *)CTFrameGetLines(frame);
+    CGPoint origins[[lines count]];
+    CTFrameGetLineOrigins(frame, CFRangeMake(0, 0), origins);
+    
+    NSUInteger lineIndex = 0;
+    for (id line in lines) {        
+        CGRect lineBounds = CTLineGetImageBounds((CTLineRef)line, c);
+        lineBounds.origin.x = origins[lineIndex].x;
+        lineBounds.origin.y = origins[lineIndex].y;
+        
+        for (id glyphRun in (NSArray *)CTLineGetGlyphRuns((CTLineRef)line)) {
+            NSDictionary *attributes = (NSDictionary *)CTRunGetAttributes((CTRunRef) glyphRun);
+            BOOL strikeOut = [[attributes objectForKey:kTTTStrikeOutAttributeName] boolValue];
+            NSInteger superscriptStyle = [[attributes objectForKey:(id)kCTSuperscriptAttributeName] integerValue];
+            
+            if (strikeOut) {
+                CGRect runBounds = CGRectZero;
+                CGFloat ascent = 0.0f;
+                CGFloat descent = 0.0f;
+                
+                runBounds.size.width = CTRunGetTypographicBounds((CTRunRef)glyphRun, CFRangeMake(0, 0), &ascent, &descent, NULL);
+                runBounds.size.height = ascent + descent;
+                
+                CGFloat xOffset = CTLineGetOffsetForStringIndex((CTLineRef)line, CTRunGetStringRange((CTRunRef)glyphRun).location, NULL);
+                runBounds.origin.x = origins[lineIndex].x + rect.origin.x + xOffset;
+                runBounds.origin.y = origins[lineIndex].y + rect.origin.y;
+                runBounds.origin.y -= descent;
+                
+                // Don't draw strikeout too far to the right
+                if (CGRectGetWidth(runBounds) > CGRectGetWidth(lineBounds)) {
+                    runBounds.size.width = CGRectGetWidth(lineBounds);
+                }
+                
+				switch (superscriptStyle) {
+					case 1:
+						runBounds.origin.y -= ascent * 0.47f;
+						break;
+					case -1:
+						runBounds.origin.y += ascent * 0.25f;
+						break;
+					default:
+						break;
+				}
+                
+                // Use text color, or default to black
+                id color = [attributes objectForKey:(id)kCTForegroundColorAttributeName];
+
+                if (color) {
+                    CGContextSetStrokeColorWithColor(c, (CGColorRef)color);
+                } else {
+                    CGContextSetGrayStrokeColor(c, 0.0f, 1.0);
+                }
+                
+                CTFontRef font = CTFontCreateWithName((CFStringRef)self.font.fontName, self.font.pointSize, NULL);
+                CGContextSetLineWidth(c, CTFontGetUnderlineThickness(font));
+                CGFloat y = roundf(runBounds.origin.y + runBounds.size.height / 2.0f);
+                CGContextMoveToPoint(c, runBounds.origin.x, y);
+                CGContextAddLineToPoint(c, runBounds.origin.x + runBounds.size.width, y);
+                
+                CGContextStrokePath(c);
+            }
+        }
+        
+        lineIndex++;
+    }
 }
 
 #pragma mark - TTTAttributedLabel
@@ -467,6 +644,7 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
 
     // First, adjust the text to be in the center vertically, if the text size is smaller than the drawing rect
     CGSize textSize = CTFramesetterSuggestFrameSizeWithConstraints(self.framesetter, textRange, NULL, textRect.size, &fitRange);
+    textSize = CGSizeMake(ceilf(textSize.width), ceilf(textSize.height)); // Fix for iOS 4, CTFramesetterSuggestFrameSizeWithConstraints sometimes returns fractional sizes
     
     if (textSize.height < textRect.size.height) {
         CGFloat yOffset = 0.0f;
@@ -483,7 +661,7 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
         }
         
         textRect.origin = CGPointMake(textRect.origin.x, textRect.origin.y + yOffset);
-        textRect.size = CGSizeMake(textRect.size.width, textRect.size.height - heightChange);
+        textRect.size = CGSizeMake(textRect.size.width, textRect.size.height - heightChange + yOffset);
     }
 
     // Second, trace the shadow before the actual text, if we have one
@@ -525,7 +703,8 @@ static inline NSAttributedString * NSAttributedStringByScalingFontSize(NSAttribu
         constraints = CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX);
     } else if (self.numberOfLines > 0) {
         // If the line count of the label more than 1, limit the range to size to the number of lines that have been set
-        CGPathRef path = CGPathCreateWithRect(CGRectMake(0.0f, 0.0f, self.bounds.size.width, CGFLOAT_MAX), NULL);
+        CGMutablePathRef path = CGPathCreateMutable();
+        CGPathAddRect(path, NULL, CGRectMake(0.0f, 0.0f, constraints.width, CGFLOAT_MAX));
         CTFrameRef frame = CTFramesetterCreateFrame(self.framesetter, CFRangeMake(0, 0), path, NULL);
         CFArrayRef lines = CTFrameGetLines(frame);
         
